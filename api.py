@@ -181,7 +181,7 @@ def check_contract_age(address, chain):
             timeout=5
         )
         data = r.json()
-        if data.get("result") and len(data["result"]) > 0 and data["result"][0].get("timeStamp"):
+        if data.get("result") and isinstance(data["result"], list) and len(data["result"]) > 0 and data["result"][0].get("timeStamp"):
             created = int(data["result"][0]["timeStamp"])
             age_seconds = time.time() - created
             age_hours = int(age_seconds / 3600)
@@ -206,7 +206,7 @@ def check_contract_verified(address, chain):
             timeout=5
         )
         data = r.json()
-        if data.get("result") and len(data["result"]) > 0:
+        if data.get("result") and isinstance(data["result"], list) and len(data["result"]) > 0:
             source = data["result"][0].get("SourceCode", "")
             return {"verified": source != "" and source is not None}
         return {"verified": False}
