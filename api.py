@@ -28,6 +28,8 @@ import re
 
 app = Flask(__name__)
 app.config["JSONIFY_PRETTYPRINT_REGULAR"] = True
+app.config["JSONIFY_PRETTYPRINT_REGULAR"] = True
+app.config["JSONIFY_PRETTYPRINT_REGULAR"] = True
 
 # ═══════════════════════════════════════════════
 # CONFIG
