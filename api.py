@@ -28,8 +28,6 @@ import re
 
 app = Flask(__name__)
 app.config["JSONIFY_PRETTYPRINT_REGULAR"] = True
-app.config["JSONIFY_PRETTYPRINT_REGULAR"] = True
-app.config["JSONIFY_PRETTYPRINT_REGULAR"] = True
 
 # ═══════════════════════════════════════════════
 # CONFIG
@@ -380,7 +378,9 @@ def score_transaction(tx, chain_id=1):
 
     # Simulate
     sim = simulate_tx(tx, chain)
-    details["simulation"] = sim
+    if sim.get("success"):
+        if sim.get("success"):
+            details["simulation"] = sim
 
     # Compute score
     score = compute_score(factors)
