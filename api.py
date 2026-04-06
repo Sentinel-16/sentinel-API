@@ -1,23 +1,19 @@
 """
-Sentinel Risk Engine API
-========================
+Sentinel Risk Engine API v1.1.0
+================================
 The same scoring engine from the Chrome extension, now as a REST API.
 Any wallet, dApp, or service can send a transaction and get back a risk assessment.
 
 Endpoints:
   POST /v1/score          — Score a transaction
   POST /v1/score/signature — Score a signature request
+  GET  /v1/address/:addr  — Check address
   GET  /v1/health         — Health check
   GET  /v1/chains         — List supported chains
 
 Run:
   pip install flask requests --break-system-packages
   python api.py
-
-Test:
-  curl -X POST http://localhost:5000/v1/score \
-    -H "Content-Type: application/json" \
-    -d '{"to":"0x1234567890abcdef1234567890abcdef12345678","data":"0x095ea7b3ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","chainId":1}'
 """
 
 from flask import Flask, request, jsonify
@@ -25,9 +21,20 @@ import requests
 import time
 import os
 import re
+import json as json_module
 
 app = Flask(__name__)
-app.config["JSONIFY_PRETTYPRINT_REGULAR"] = True
+
+@app.after_request
+def prettify_json(response):
+    if 'application/json' in response.content_type:
+        try:
+            data = json_module.loads(response.get_data())
+            response.set_data(json_module.dumps(data, indent=2))
+        except Exception:
+            pass
+    return response
+
 
 # ═══════════════════════════════════════════════
 # CONFIG
@@ -41,7 +48,6 @@ API_KEYS = {
     "TENDERLY_PROJECT": os.environ.get("TENDERLY_PROJECT", ""),
 }
 
-# API key for clients calling this API (simple auth)
 SENTINEL_API_KEY = os.environ.get("SENTINEL_API_KEY", "dev-key-change-in-production")
 
 CHAIN_CONFIG = {
@@ -56,17 +62,26 @@ CHAIN_CONFIG = {
 }
 
 RISK_WEIGHTS = {
-    "SCAM_ADDRESS":       {"score": 95, "override": True},
-    "UNLIMITED_APPROVAL": {"score": 60, "override": False},
-    "CONTRACT_NEW":       {"score": 30, "override": False},
-    "CONTRACT_UNVERIFIED":{"score": 25, "override": False},
-    "NO_CONTRACT_CODE":   {"score": 35, "override": False},
-    "PERMIT_SIGNATURE":   {"score": 45, "override": False},
-    "ADDRESS_SIMILAR":    {"score": 35, "override": False},
-    "LARGE_OUTFLOW":      {"score": 20, "override": False},
-    "SUSPICIOUS_ADDRESS": {"score": 30, "override": False},
-    "FIRST_INTERACTION":  {"score": 10, "override": False},
-    "DRAIN_PATTERN":      {"score": 90, "override": True},
+    "SCAM_ADDRESS":         {"score": 95, "override": True},
+    "UNLIMITED_APPROVAL":   {"score": 60, "override": False},
+    "CONTRACT_NEW":         {"score": 30, "override": False},
+    "CONTRACT_UNVERIFIED":  {"score": 25, "override": False},
+    "NO_CONTRACT_CODE":     {"score": 35, "override": False},
+    "PERMIT_SIGNATURE":     {"score": 45, "override": False},
+    "ADDRESS_SIMILAR":      {"score": 35, "override": False},
+    "LARGE_OUTFLOW":        {"score": 20, "override": False},
+    "SUSPICIOUS_ADDRESS":   {"score": 30, "override": False},
+    "FIRST_INTERACTION":    {"score": 10, "override": False},
+    "DRAIN_PATTERN":        {"score": 90, "override": True},
+    # NEW checks
+    "SET_APPROVAL_FOR_ALL": {"score": 70, "override": False},
+    "HONEYPOT_TOKEN":       {"score": 85, "override": True},
+    "DRAINER_SIGNATURE":    {"score": 90, "override": True},
+    "EMPTY_RECIPIENT":      {"score": 40, "override": False},
+    "LARGE_ETH_TRANSFER":   {"score": 25, "override": False},
+    "KNOWN_PHISHING_SIG":   {"score": 80, "override": True},
+    "MULTIPLE_APPROVALS":   {"score": 50, "override": False},
+    "ETH_SIGN_DANGEROUS":   {"score": 75, "override": False},
 }
 
 KNOWN_ADDRESSES = {
@@ -89,6 +104,25 @@ KNOWN_ADDRESSES = {
     "0x00000000000001ad428e4906ae43d8f9852d0dd6": "OpenSea Seaport 1.5",
 }
 
+# Known drainer function signatures
+DRAINER_SIGNATURES = {
+    "0x5fd3ad18": "SecurityUpdate",
+    "0x2d0335ab": "ClaimRewards",
+    "0x8a4068dd": "ClaimAirdrop",
+    "0x715488af": "multicall_drain",
+    "0xb2bd16ab": "Connect",
+    "0x9b1ccc15": "SwapExactETH",
+    "0x2e1a7d4d": "withdraw",  # suspicious if to unverified contract
+    "0xf3fef3a3": "withdraw_to",
+    "0x3ccfd60b": "withdraw_all",
+}
+
+# Common phishing function names (matched against verified source code)
+PHISHING_FUNCTION_NAMES = [
+    "securityupdate", "claimreward", "claimairdrop", "connectwallet",
+    "enabletrading", "starttrading", "activate", "safeclaim",
+]
+
 MAX_UINT256 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 MAX_UINT256_DEC = "115792089237316195423570985008687907853269984665640564039457584007913129639935"
 MAX_UINT160_DEC = "1461501637330902918203684832716283019655932542975"
@@ -99,6 +133,9 @@ TOKEN_NAMES = {
     "0x6b175474e89094c44da98b954eedeac495271d0f": "DAI",
     "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": "WETH",
 }
+
+# ETH transfer threshold for LARGE_ETH_TRANSFER flag (in ETH)
+LARGE_ETH_THRESHOLD = 5.0
 
 
 # ═══════════════════════════════════════════════
@@ -141,6 +178,27 @@ def get_level(score):
         return "high"
     return "critical"
 
+def lookup_function_sig(sig_hex):
+    """Look up 4-byte function signature against known drainer sigs and public databases"""
+    # Check local drainer database first
+    if sig_hex.lower() in DRAINER_SIGNATURES:
+        return {"name": DRAINER_SIGNATURES[sig_hex.lower()], "is_drainer": True}
+    # Try 4byte.directory for function name
+    try:
+        r = requests.get(
+            f"https://www.4byte.directory/api/v1/signatures/?hex_signature={sig_hex}",
+            timeout=3
+        )
+        if r.ok:
+            data = r.json()
+            results = data.get("results", [])
+            if results:
+                name = results[0].get("text_signature", "unknown")
+                return {"name": name, "is_drainer": False}
+    except Exception:
+        pass
+    return {"name": "unknown", "is_drainer": False}
+
 
 # ═══════════════════════════════════════════════
 # CHECK FUNCTIONS — Live API calls
@@ -163,10 +221,78 @@ def check_scam_address(address, chain):
             if result.get("stealing_attack") == "1": flags.append("stealing attack")
             if result.get("honeypot_related_address") == "1": flags.append("honeypot related")
             if result.get("financial_crime") == "1": flags.append("financial crime")
+            if result.get("malicious_mining_activities") == "1": flags.append("malicious mining")
+            if result.get("darkweb_transactions") == "1": flags.append("darkweb activity")
+            if result.get("cybercrime") == "1": flags.append("cybercrime")
+            if result.get("money_laundering") == "1": flags.append("money laundering")
+            if result.get("number_of_malicious_contracts_created", "0") != "0": flags.append("created malicious contracts")
             return {"is_scam": len(flags) > 0, "reason": ", ".join(flags)}
         return {"is_scam": False, "reason": ""}
     except Exception as e:
         return {"is_scam": False, "reason": "", "error": str(e)}
+
+
+def check_honeypot_token(address, chain):
+    """Check if a token is a honeypot (can buy but can't sell)"""
+    try:
+        r = requests.get(
+            f"https://api.gopluslabs.io/api/v1/token_security/{chain['goplusId']}",
+            params={"contract_addresses": address},
+            headers={"Authorization": API_KEYS["GOPLUS"]},
+            timeout=5
+        )
+        data = r.json()
+        result = data.get("result", {}).get(address.lower(), {})
+        if not result:
+            return {"is_honeypot": False}
+
+        flags = []
+        is_honeypot = result.get("is_honeypot") == "1"
+        if is_honeypot:
+            flags.append("token cannot be sold")
+        if result.get("is_mintable") == "1":
+            flags.append("token is mintable (supply can be inflated)")
+        if result.get("can_take_back_ownership") == "1":
+            flags.append("ownership can be reclaimed")
+        if result.get("owner_change_balance") == "1":
+            flags.append("owner can change balances")
+        if result.get("hidden_owner") == "1":
+            flags.append("hidden owner detected")
+        if result.get("selfdestruct") == "1":
+            flags.append("contract can self-destruct")
+        if result.get("external_call") == "1":
+            flags.append("contract makes external calls")
+        if result.get("is_proxy") == "1":
+            flags.append("proxy contract (logic can be changed)")
+        if result.get("transfer_pausable") == "1":
+            flags.append("transfers can be paused")
+        if result.get("trading_cooldown") == "1":
+            flags.append("trading cooldown enabled")
+        if result.get("is_anti_whale") == "1":
+            flags.append("anti-whale mechanism")
+        if result.get("cannot_sell_all") == "1":
+            flags.append("cannot sell full balance")
+
+        buy_tax = result.get("buy_tax", "0")
+        sell_tax = result.get("sell_tax", "0")
+        try:
+            if float(sell_tax) > 10:
+                flags.append(f"high sell tax: {sell_tax}%")
+            if float(buy_tax) > 10:
+                flags.append(f"high buy tax: {buy_tax}%")
+        except (ValueError, TypeError):
+            pass
+
+        return {
+            "is_honeypot": is_honeypot or len(flags) > 2,
+            "flags": flags,
+            "buy_tax": buy_tax,
+            "sell_tax": sell_tax,
+            "holder_count": result.get("holder_count", "unknown"),
+            "lp_holder_count": result.get("lp_holder_count", "unknown"),
+        }
+    except Exception as e:
+        return {"is_honeypot": False, "error": str(e)}
 
 
 def check_contract_age(address, chain):
@@ -209,10 +335,14 @@ def check_contract_verified(address, chain):
         data = r.json()
         if data.get("result") and isinstance(data["result"], list) and len(data["result"]) > 0:
             source = data["result"][0].get("SourceCode", "")
-            return {"verified": source != "" and source is not None}
-        return {"verified": False}
+            contract_name = data["result"][0].get("ContractName", "")
+            return {
+                "verified": source != "" and source is not None,
+                "contract_name": contract_name
+            }
+        return {"verified": False, "contract_name": ""}
     except Exception as e:
-        return {"verified": False, "error": str(e)}
+        return {"verified": False, "contract_name": "", "error": str(e)}
 
 
 def check_suspicious_address(address):
@@ -227,6 +357,53 @@ def check_suspicious_address(address):
     if clean.startswith("000000000000000000000000000000"):
         return {"suspicious": True, "reason": "Address is mostly zeros"}
     return {"suspicious": False}
+
+
+def check_address_balance(address, chain):
+    """Check if recipient address has any ETH balance or transaction history"""
+    try:
+        r = requests.get(
+            explorer_url(chain),
+            params={
+                "module": "account",
+                "action": "balance",
+                "address": address,
+                "tag": "latest",
+                "apikey": API_KEYS["ETHERSCAN"]
+            },
+            timeout=5
+        )
+        data = r.json()
+        if data.get("result") and isinstance(data["result"], str):
+            balance_wei = int(data["result"])
+            balance_eth = balance_wei / 1e18
+            return {"balance_eth": balance_eth, "is_empty": balance_eth == 0}
+        return {"balance_eth": 0, "is_empty": True}
+    except Exception as e:
+        return {"balance_eth": 0, "is_empty": True, "error": str(e)}
+
+
+def check_address_tx_count(address, chain):
+    """Check how many transactions an address has — low count = suspicious"""
+    try:
+        r = requests.get(
+            explorer_url(chain),
+            params={
+                "module": "proxy",
+                "action": "eth_getTransactionCount",
+                "address": address,
+                "tag": "latest",
+                "apikey": API_KEYS["ETHERSCAN"]
+            },
+            timeout=5
+        )
+        data = r.json()
+        if data.get("result"):
+            tx_count = int(data["result"], 16)
+            return {"tx_count": tx_count, "is_new_address": tx_count < 5}
+        return {"tx_count": 0, "is_new_address": True}
+    except Exception as e:
+        return {"tx_count": 0, "is_new_address": True, "error": str(e)}
 
 
 def simulate_tx(tx, chain):
@@ -254,7 +431,7 @@ def simulate_tx(tx, chain):
         latency = int((time.time() - start) * 1000)
 
         if not r.ok:
-            return {"success": False, "latency_ms": latency, "error": f"HTTP {r.status_code}"}
+            return {"success": False, "latency_ms": latency}
 
         data = r.json()
         sim = data.get("simulation", data.get("transaction", {}))
@@ -268,7 +445,7 @@ def simulate_tx(tx, chain):
 
         return {"success": True, "latency_ms": latency, "balance_changes": balance_changes}
     except Exception as e:
-        return {"success": False, "latency_ms": 0, "error": str(e)}
+        return {"success": False, "latency_ms": 0}
 
 
 # ═══════════════════════════════════════════════
@@ -282,12 +459,21 @@ def decode_approval(data_hex):
     spender = "0x" + data_hex[34:74]
     amount_hex = data_hex[74:138]
     unlimited = amount_hex.replace("0", "").lower() == "f" * len(amount_hex.replace("0", ""))
-    # More precise check
     if amount_hex.lower().strip("0") == "" and len(amount_hex) > 10:
-        unlimited = False  # all zeros = zero approval
+        unlimited = False
     if amount_hex.lower() == MAX_UINT256:
         unlimited = True
     return {"spender": spender, "unlimited": unlimited, "amount_hex": amount_hex}
+
+
+def decode_set_approval_for_all(data_hex):
+    """Decode ERC-721/1155 setApprovalForAll(address,bool)"""
+    if len(data_hex) < 138:
+        return None
+    operator = "0x" + data_hex[34:74]
+    approved_hex = data_hex[74:138]
+    approved = approved_hex.strip("0") != "" and approved_hex[-1] == "1"
+    return {"operator": operator, "approved": approved}
 
 
 def decode_permit(typed_data):
@@ -327,8 +513,9 @@ def score_transaction(tx, chain_id=1):
     details = {"chain": chain["name"], "chain_id": chain_id, "to": to, "to_label": label_address(to)}
     summary = ""
 
-    # Decode transaction type
+    # ── Decode transaction type ──
     if data.startswith("0x095ea7b3"):
+        # ERC-20 approve
         approval = decode_approval(data)
         if approval:
             details["type"] = "Token Approval"
@@ -341,48 +528,108 @@ def score_transaction(tx, chain_id=1):
                 details["suggestion"] = "Consider approving only the amount needed instead of unlimited."
             else:
                 summary = f"Approves token spending by {label_address(approval['spender'])}."
-    elif data == "0x" and value > 0:
-        details["type"] = "Native Transfer"
-        details["value_eth"] = value / 1e18
-        summary = f"Sends {value / 1e18:.6f} ETH to {label_address(to)}."
-    else:
-        details["type"] = "Contract Interaction"
-        details["function_sig"] = data[:10]
-        summary = f"Interacts with smart contract at {label_address(to)}."
 
-    # Run checks
+    elif data.startswith("0xa22cb465"):
+        # ERC-721/1155 setApprovalForAll — #1 NFT drainer pattern
+        approval = decode_set_approval_for_all(data)
+        if approval and approval["approved"]:
+            details["type"] = "NFT Approval (setApprovalForAll)"
+            details["operator"] = approval["operator"]
+            details["operator_label"] = label_address(approval["operator"])
+            factors.append({"type": "SET_APPROVAL_FOR_ALL", "detail": f"Grants full access to ALL your NFTs in this collection to {label_address(approval['operator'])}"})
+            summary = f"Grants {label_address(approval['operator'])} permission to transfer ALL your NFTs from this contract. This is the #1 method used in NFT phishing attacks."
+            details["suggestion"] = "Only approve setApprovalForAll for marketplaces you trust (OpenSea, Blur, etc)."
+
+            # Extra suspicious if operator is not a known marketplace
+            if approval["operator"].lower() not in KNOWN_ADDRESSES:
+                factors.append({"type": "DRAINER_SIGNATURE", "detail": "setApprovalForAll to unknown operator — high probability of NFT drain"})
+        elif approval and not approval["approved"]:
+            details["type"] = "NFT Revoke (setApprovalForAll)"
+            summary = "Revokes NFT access. This is a safe operation."
+
+    elif data == "0x" and value > 0:
+        # Native ETH transfer
+        details["type"] = "Native Transfer"
+        value_eth = value / 1e18
+        details["value_eth"] = value_eth
+        summary = f"Sends {value_eth:.6f} ETH to {label_address(to)}."
+
+        if value_eth >= LARGE_ETH_THRESHOLD:
+            factors.append({"type": "LARGE_ETH_TRANSFER", "detail": f"Large transfer: {value_eth:.2f} ETH (${value_eth * 2000:.0f} approx)"})
+
+    else:
+        # Contract interaction — check function signature
+        func_sig = data[:10] if len(data) >= 10 else data
+        sig_info = lookup_function_sig(func_sig)
+
+        details["type"] = "Contract Interaction"
+        details["function_sig"] = func_sig
+        details["function_name"] = sig_info["name"]
+
+        if sig_info["is_drainer"]:
+            factors.append({"type": "DRAINER_SIGNATURE", "detail": f"Known drainer function detected: {sig_info['name']}()"})
+            summary = f"DANGER: This transaction calls {sig_info['name']}(), which is a known drainer function signature. Do NOT proceed."
+        else:
+            summary = f"Calls {sig_info['name']}() on contract at {label_address(to)}."
+
+    # ── Run checks ──
+
+    # Scam address check (GoPlus)
     scam = check_scam_address(to, chain)
     if scam["is_scam"]:
         factors.append({"type": "SCAM_ADDRESS", "detail": f"Address flagged as scam: {scam['reason']}"})
+    details["scam_check"] = scam
 
+    # Contract age check
     age = check_contract_age(to, chain)
     if age["is_new"]:
         factors.append({"type": "CONTRACT_NEW", "detail": f"Contract deployed {age['age']} on {chain['name']}"})
-        details["contract_age"] = age["age"]
+    details["contract_age"] = age["age"]
 
+    # Contract verification check
     verified = check_contract_verified(to, chain)
     if not verified["verified"]:
         factors.append({"type": "CONTRACT_UNVERIFIED", "detail": f"Contract not verified on {chain['name']} block explorer"})
         details["verified"] = False
     else:
         details["verified"] = True
+        details["contract_name"] = verified.get("contract_name", "")
 
     # Approval to non-contract
     if data.startswith("0x095ea7b3") and age["age"] == "not a contract":
         factors.append({"type": "NO_CONTRACT_CODE", "detail": "Token approval targets a regular address (not a smart contract)"})
 
-    # Suspicious address
+    # setApprovalForAll to non-contract
+    if data.startswith("0xa22cb465") and age["age"] == "not a contract":
+        factors.append({"type": "NO_CONTRACT_CODE", "detail": "NFT approval targets a regular address (not a smart contract)"})
+
+    # Suspicious address pattern
     susp = check_suspicious_address(to)
     if susp.get("suspicious"):
         factors.append({"type": "SUSPICIOUS_ADDRESS", "detail": susp["reason"]})
 
-    # Simulate
+    # NEW: Empty recipient check
+    if data != "0x" or value > 0:
+        balance_info = check_address_balance(to, chain)
+        tx_count = check_address_tx_count(to, chain)
+        if balance_info["is_empty"] and tx_count.get("is_new_address", True) and age["age"] == "not a contract":
+            factors.append({"type": "EMPTY_RECIPIENT", "detail": f"Recipient has zero balance and {tx_count.get('tx_count', 0)} transactions — possible disposable drainer address"})
+        details["recipient_balance_eth"] = balance_info.get("balance_eth", 0)
+        details["recipient_tx_count"] = tx_count.get("tx_count", 0)
+
+    # NEW: Honeypot check for token interactions
+    if data.startswith(("0x095ea7b3", "0xa9059cbb", "0x23b872dd")):
+        honeypot = check_honeypot_token(to, chain)
+        if honeypot.get("is_honeypot"):
+            factors.append({"type": "HONEYPOT_TOKEN", "detail": f"Token flagged as honeypot: {', '.join(honeypot.get('flags', []))}"})
+            details["honeypot"] = honeypot
+
+    # Simulate transaction
     sim = simulate_tx(tx, chain)
     if sim.get("success"):
-        if sim.get("success"):
-            details["simulation"] = sim
+        details["simulation"] = sim
 
-    # Compute score
+    # ── Compute final score ──
     score = compute_score(factors)
     level = get_level(score)
 
@@ -425,19 +672,29 @@ def score_signature(method, typed_data, chain_id=1):
 
             if permit["unlimited"]:
                 factors.append({"type": "UNLIMITED_APPROVAL", "detail": "Permit grants unlimited token access"})
+
+            # Check if spender is known
+            if permit["spender"].lower() not in KNOWN_ADDRESSES:
+                factors.append({"type": "DRAINER_SIGNATURE", "detail": f"Permit spender {label_address(permit['spender'])} is not a recognized protocol"})
         else:
             details["type"] = "Typed Data Signature"
             details["primary_type"] = primary_type
             summary = f"Requests signature on {primary_type} typed data."
 
     elif method == "eth_sign":
-        factors.append({"type": "PERMIT_SIGNATURE", "detail": "eth_sign can authorize arbitrary actions. Most legitimate dApps use personal_sign instead."})
-        details["type"] = "Dangerous Signature"
-        summary = "WARNING: eth_sign can authorize dangerous actions. Most legitimate applications do not use this method."
+        factors.append({"type": "ETH_SIGN_DANGEROUS", "detail": "eth_sign can authorize ANY action on your wallet. This is the most dangerous signature method."})
+        details["type"] = "Dangerous Signature (eth_sign)"
+        summary = "CRITICAL: eth_sign can authorize arbitrary actions including draining your entire wallet. Legitimate dApps NEVER use this method. This is almost certainly a scam."
 
     elif method == "personal_sign":
         details["type"] = "Message Signature"
-        summary = "Requests signature on a text message. Generally safe."
+        summary = "Requests signature on a text message. Generally safe, but verify the message content."
+
+        # Check for suspicious personal_sign messages that look like they contain hex data
+        message = typed_data if isinstance(typed_data, str) else str(typed_data)
+        if message.startswith("0x") and len(message) > 100:
+            factors.append({"type": "KNOWN_PHISHING_SIG", "detail": "personal_sign with hex data — may be disguised transaction authorization"})
+            summary = "WARNING: This message signature contains hex data that could authorize a transaction. Verify the content carefully."
 
     score = compute_score(factors)
     level = get_level(score)
@@ -460,10 +717,9 @@ def score_signature(method, typed_data, chain_id=1):
 # ═══════════════════════════════════════════════
 
 def check_auth():
-    """Simple API key auth — replace with proper auth in production"""
     key = request.headers.get("X-API-Key") or request.args.get("api_key")
     if SENTINEL_API_KEY == "dev-key-change-in-production":
-        return True  # Dev mode, no auth required
+        return True
     if key != SENTINEL_API_KEY:
         return False
     return True
@@ -478,9 +734,27 @@ def health():
     return jsonify({
         "status": "ok",
         "engine": "sentinel",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "chains": len(CHAIN_CONFIG),
-        "signals": len(RISK_WEIGHTS)
+        "signals": len(RISK_WEIGHTS),
+        "checks": [
+            "scam_address_detection",
+            "honeypot_token_detection",
+            "contract_age_verification",
+            "contract_source_verification",
+            "unlimited_approval_detection",
+            "setApprovalForAll_detection",
+            "drainer_signature_detection",
+            "suspicious_address_patterns",
+            "empty_recipient_detection",
+            "large_transfer_detection",
+            "permit_signature_analysis",
+            "eth_sign_detection",
+            "function_signature_lookup",
+            "transaction_simulation",
+            "recipient_balance_check",
+            "recipient_history_check",
+        ]
     })
 
 
@@ -553,6 +827,8 @@ def check_address(address):
     susp = check_suspicious_address(address)
     age = check_contract_age(address, chain)
     verified = check_contract_verified(address, chain)
+    balance = check_address_balance(address, chain)
+    tx_count = check_address_tx_count(address, chain)
 
     return jsonify({
         "address": address,
@@ -562,6 +838,8 @@ def check_address(address):
         "suspicious": susp,
         "contract_age": age,
         "verified": verified,
+        "balance_eth": balance.get("balance_eth", 0),
+        "tx_count": tx_count.get("tx_count", 0),
         "chain": chain["name"]
     })
 
@@ -573,15 +851,17 @@ def check_address(address):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"""
-╔══════════════════════════════════════════╗
-║   Sentinel Risk Engine API v1.0.0        ║
-║   Running on http://localhost:{port}        ║
-╠══════════════════════════════════════════╣
-║   POST /v1/score          Score a tx     ║
-║   POST /v1/score/signature Score a sig   ║
-║   GET  /v1/address/:addr  Check address  ║
-║   GET  /v1/health         Health check   ║
-║   GET  /v1/chains         List chains    ║
-╚══════════════════════════════════════════╝
+╔══════════════════════════════════════════════╗
+║   Sentinel Risk Engine API v1.1.0            ║
+║   Running on http://localhost:{port}            ║
+╠══════════════════════════════════════════════╣
+║   POST /v1/score            Score a tx       ║
+║   POST /v1/score/signature  Score a sig      ║
+║   GET  /v1/address/:addr    Check address    ║
+║   GET  /v1/health           Health check     ║
+║   GET  /v1/chains           List chains      ║
+╠══════════════════════════════════════════════╣
+║   16 detection checks | 8 chains supported   ║
+╚══════════════════════════════════════════════╝
     """)
     app.run(host="0.0.0.0", port=port, debug=True)
